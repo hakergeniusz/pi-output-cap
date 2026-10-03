@@ -169,6 +169,10 @@ function assert(cond: boolean, label: string) {
 	const reloaded = loadConfig();
 	assert(reloaded.perResponse === 24_000 && reloaded.runSoft === 90_000, "config survives a save/load round trip");
 
+	process.env.PI_OUTPUT_CAP_STATUS = "1";
+	assert(loadConfig().status === true, "PI_OUTPUT_CAP_STATUS=1 turns the footer counter on");
+	delete process.env.PI_OUTPUT_CAP_STATUS;
+
 	process.env.PI_OUTPUT_CAP = "off";
 	assert(loadConfig().enabled === false, "PI_OUTPUT_CAP=off disables the guard");
 	process.env.PI_OUTPUT_CAP_PER_RESPONSE = "8192";
@@ -327,6 +331,11 @@ function assert(cond: boolean, label: string) {
 
 	await fake.commands.outcap.handler("", ctx(fake));
 	assert(fake.notifications.some((n) => n.includes("per response: 16384")), "/outcap reports the caps");
+	assert(fake.notifications.some((n) => n.includes("footer counter off")), "the footer counter is off by default");
+	assert(
+		fake.statuses.every((s) => s === undefined),
+		"no footer text is rendered while the counter is off",
+	);
 	assert(fake.notifications.some((n) => n.includes("5.0k")), "/outcap reports this run's output");
 
 	await fake.commands.outcap.handler("off", ctx(fake));
@@ -349,6 +358,15 @@ function assert(cond: boolean, label: string) {
 	assert(fake.notifications.some((n) => n.includes("per response: 24576")), "/outcap per-response sets the cap");
 	assert(fake.notifications.some((n) => n.includes("steer at 90000")), "/outcap run sets the run budgets");
 	assert(JSON.parse(readFileSync(process.env.PI_OUTPUT_CAP_CONFIG as string, "utf8")).perResponse === 24576, "command changes are persisted");
+	assert(JSON.parse(readFileSync(process.env.PI_OUTPUT_CAP_CONFIG as string, "utf8")).status === false, "the footer setting is persisted");
+
+	await fake.commands.outcap.handler("on", ctx(fake));
+	await fake.commands.outcap.handler("status on", ctx(fake));
+	await emit(fake, "message_end", assistant(3_000));
+	assert(fake.statuses.some((s) => typeof s === "string" && s.includes("out 8.0k")), "/outcap status on shows the counter");
+	await fake.commands.outcap.handler("status off", ctx(fake));
+	await emit(fake, "message_end", assistant(4_000));
+	assert(fake.statuses.at(-1) === undefined, "/outcap status off clears the footer");
 
 	await fake.commands.outcap.handler("wrapup land it", ctx(fake));
 	assert(fake.sent.some((m) => m.content.includes("land it")), "/outcap wrapup sends the instruction");

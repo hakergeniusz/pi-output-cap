@@ -52,6 +52,9 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 export interface CapConfig {
 	/** Master switch. When false nothing is capped and nothing is injected. */
 	enabled: boolean;
+	/** Show the live token counter in the footer status line. Off by default: the
+	 *  footer already carries context usage, and a third counter is noise. */
+	status: boolean;
 	/** Output tokens allowed for one response. 0 disables the per-response cap. */
 	perResponse: number;
 	/** Output tokens for a whole run before the agent is steered to wrap up. 0 disables. */
@@ -64,6 +67,7 @@ export interface CapConfig {
 
 export const DEFAULTS: CapConfig = {
 	enabled: true,
+	status: false,
 	perResponse: 16_384,
 	runSoft: 60_000,
 	runHard: 100_000,
@@ -105,12 +109,15 @@ export function loadConfig(): CapConfig {
 
 	const config: CapConfig = { ...DEFAULTS };
 	if (typeof stored.enabled === "boolean") config.enabled = stored.enabled;
+	if (typeof stored.status === "boolean") config.status = stored.status;
 	for (const key of ["perResponse", "runSoft", "runHard", "wrapUpCap"] as const) {
 		const value = stored[key];
 		if (typeof value === "number" && Number.isFinite(value) && value >= 0) config[key] = Math.floor(value);
 	}
 
 	if (process.env.PI_OUTPUT_CAP?.trim().toLowerCase() === "off") config.enabled = false;
+	const statusEnv = process.env.PI_OUTPUT_CAP_STATUS?.trim().toLowerCase();
+	if (statusEnv) config.status = statusEnv === "1" || statusEnv === "on" || statusEnv === "true";
 	const perResponse = envNum("PI_OUTPUT_CAP_PER_RESPONSE");
 	if (perResponse !== undefined) config.perResponse = perResponse;
 	const runSoft = envNum("PI_OUTPUT_CAP_RUN_SOFT");
@@ -367,7 +374,9 @@ export default function (pi: ExtensionAPI) {
 	const setStatus = (ctx: unknown) => {
 		try {
 			const ui = (ctx as UiLike).ui;
-			if (!config.enabled) {
+			// The footer counter is opt-in; when it is off, make sure nothing of
+			// ours is left in the footer from an earlier setting.
+			if (!config.enabled || !config.status) {
 				ui?.setStatus?.("pi-output-cap", undefined);
 				return;
 			}
@@ -585,7 +594,7 @@ export default function (pi: ExtensionAPI) {
 	// -------------------------------------------------------------------------
 	const report = (ctx: unknown): string => {
 		const lines = [
-			`pi-output-cap ${config.enabled ? "on" : "off"}`,
+			`pi-output-cap ${config.enabled ? "on" : "off"} (footer counter ${config.status ? "on" : "off"})`,
 			`  per response: ${config.perResponse > 0 ? `${config.perResponse} tokens` : "uncapped"}`,
 			`  per run:     ${config.runSoft > 0 ? `steer at ${config.runSoft}` : "no steer"}` +
 				`${config.runHard > 0 ? `, abort at ${config.runHard}` : ", no abort"}`,
@@ -602,9 +611,9 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerCommand("outcap", {
 		description:
-			"Output-budget guard: /outcap shows it — /outcap off|on toggles — /outcap per-response <n|off> — /outcap run <soft|off> [hard|off] — /outcap wrapup [text]",
+			"Output-budget guard: /outcap shows it — /outcap off|on toggles — /outcap status on|off toggles the footer counter — /outcap per-response <n|off> — /outcap run <soft|off> [hard|off] — /outcap wrapup [text]",
 		getArgumentCompletions: (prefix: string) => {
-			const subs = ["on", "off", "per-response", "run", "wrapup"];
+			const subs = ["on", "off", "status", "per-response", "run", "wrapup"];
 			const matches = subs.filter((s) => s.startsWith(prefix));
 			return matches.length > 0 ? matches.map((value) => ({ value, label: value })) : null;
 		},
@@ -630,6 +639,19 @@ export default function (pi: ExtensionAPI) {
 				saveConfig(config);
 				notify(ctx, `pi-output-cap ${config.enabled ? "enabled" : "disabled"}`, "info");
 				setStatus(ctx);
+				return;
+			}
+
+			if (sub === "status" || sub === "footer") {
+				const wanted = (values || rawSub || "on").toLowerCase();
+				if (wanted === "on" || wanted === "off") {
+					config.status = wanted === "on";
+					saveConfig(config);
+					setStatus(ctx);
+					notify(ctx, `pi-output-cap: footer counter ${wanted}`, "info");
+				} else {
+					notify(ctx, "usage: /outcap status on|off", "warning");
+				}
 				return;
 			}
 

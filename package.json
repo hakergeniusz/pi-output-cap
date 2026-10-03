@@ -1,0 +1,34 @@
+{
+	"name": "pi-output-cap",
+	"version": "0.1.0",
+	"description": "Hard-cap every model response's output tokens and each run's total, steer the agent to land the answer before the budget runs out, and replace 'response was truncated' with a short wrap-up.",
+	"type": "module",
+	"license": "MIT",
+	"keywords": [
+		"pi",
+		"pi-package",
+		"output-tokens",
+		"truncation",
+		"budget",
+		"guard"
+	],
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/hakergeniusz/pi-output-cap.git"
+	},
+	"bugs": {
+		"url": "https://github.com/hakergeniusz/pi-output-cap/issues"
+	},
+	"homepage": "https://github.com/hakergeniusz/pi-output-cap#readme",
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"devDependencies": {
+		"@types/node": "^26.6.4"
+	}
+}

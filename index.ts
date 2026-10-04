@@ -1,15 +1,19 @@
 /**
- * pi-output-cap — a run that spends 100k+ output tokens and ends truncated has
- * achieved nothing. Make that outcome unreachable, and recoverable when a
- * provider still forces it.
+ * pi-output-cap — a single response that spends 100k+ output tokens and ends
+ * truncated has achieved nothing. Make that outcome unreachable, and
+ * recoverable when a provider still forces it.
  *
- * The failure this exists for: the agent streams one enormous response (or an
- * endless turn of them), the provider cuts it at the model's max-output limit,
- * and pi prints "Response was truncated before completion." over an empty
- * result. Nothing written, nothing verified, nothing answered — and the only
- * warning is the one line the user sees after the bill.
+ * The failure this exists for: the agent streams one enormous response, the
+ * provider cuts it at the model's max-output limit, and pi prints "Response was
+ * truncated before completion." over an empty result. Nothing written, nothing
+ * verified, nothing answered — and the only warning is the one line the user
+ * sees after the bill.
  *
- * Four layers, each fail-open:
+ * The limit is per model turn, never per chat. A long conversation with many
+ * turns is not a budget problem; one runaway response is. Nothing here sums
+ * output across a run, steers at a run total, or aborts on one.
+ *
+ * Three layers, each fail-open:
  *
  *  1. Hard cap per response (`before_provider_request`). Every output-limit
  *     field in the outgoing provider payload — `max_tokens`,
@@ -22,19 +26,16 @@
  *     their full budget.
  *  2. Tell the agent it has a budget (`before_agent_start`). One deterministic
  *     guideline bullet, so the cached prompt prefix survives turn to turn.
- *  3. Budget for the whole run. Output tokens are summed per agent run. At the
- *     soft budget the agent is steered to land the answer; at the hard budget
- *     the run is aborted so it cannot keep spending.
- *  4. Wrap-up instead of silence (`agent_before_settle`). A run that ended with
- *     a truncated response, or was aborted by the hard budget, gets exactly one
- *     extra turn under a small cap with a strict instruction: at most 120 words
- *     — what is done, what is not, the exact next step. The user gets an answer
- *     instead of a cut-off blob.
+ *  3. Wrap-up instead of silence (`agent_before_settle`). A run whose last
+ *     response was cut off at the cap gets exactly one extra turn under a small
+ *     cap with a strict instruction: at most 120 words — what is done, what is
+ *     not, the exact next step. The user gets an answer instead of a cut-off
+ *     blob.
  *
  * Deliberately not done: no mid-stream token counting (the payload cap already
  * bounds the response), no re-generation of truncated text, no edits to the
- * model's declared maxTokens in models.json, no interference with the user's
- * own abort.
+ * model's declared maxTokens in models.json, no run totals that accumulate
+ * across turns, no interference with the user's own abort.
  *
  * Fail-open contract: on any surprise the payload, the run, and the transcript
  * stay exactly as pi built them. A guard that breaks a session is worse than a
@@ -55,12 +56,8 @@ export interface CapConfig {
 	/** Show the live token counter in the footer status line. Off by default: the
 	 *  footer already carries context usage, and a third counter is noise. */
 	status: boolean;
-	/** Output tokens allowed for one response. 0 disables the per-response cap. */
+	/** Output tokens allowed for one model turn. 0 disables the per-response cap. */
 	perResponse: number;
-	/** Output tokens for a whole run before the agent is steered to wrap up. 0 disables. */
-	runSoft: number;
-	/** Output tokens for a whole run before the run is aborted. 0 disables. */
-	runHard: number;
 	/** Output tokens allowed for the forced wrap-up turn. */
 	wrapUpCap: number;
 }
@@ -69,15 +66,11 @@ export const DEFAULTS: CapConfig = {
 	enabled: true,
 	status: false,
 	perResponse: 16_384,
-	runSoft: 60_000,
-	runHard: 100_000,
 	wrapUpCap: 2_048,
 };
 
 /** Providers reject absurdly small caps; keep the floor high enough to be safe. */
 const MIN_CAP = 512;
-/** A run is "closing" at this fraction of its budget for the status line. */
-const WARN_FRACTION = 0.75;
 /** A response at this fraction of the cap counts as "hit the ceiling". */
 const CAP_HIT_FRACTION = 0.9;
 /** Wrap-up reply length the agent is asked for, in words. */
@@ -110,7 +103,7 @@ export function loadConfig(): CapConfig {
 	const config: CapConfig = { ...DEFAULTS };
 	if (typeof stored.enabled === "boolean") config.enabled = stored.enabled;
 	if (typeof stored.status === "boolean") config.status = stored.status;
-	for (const key of ["perResponse", "runSoft", "runHard", "wrapUpCap"] as const) {
+	for (const key of ["perResponse", "wrapUpCap"] as const) {
 		const value = stored[key];
 		if (typeof value === "number" && Number.isFinite(value) && value >= 0) config[key] = Math.floor(value);
 	}
@@ -120,10 +113,6 @@ export function loadConfig(): CapConfig {
 	if (statusEnv) config.status = statusEnv === "1" || statusEnv === "on" || statusEnv === "true";
 	const perResponse = envNum("PI_OUTPUT_CAP_PER_RESPONSE");
 	if (perResponse !== undefined) config.perResponse = perResponse;
-	const runSoft = envNum("PI_OUTPUT_CAP_RUN_SOFT");
-	if (runSoft !== undefined) config.runSoft = runSoft;
-	const runHard = envNum("PI_OUTPUT_CAP_RUN_HARD");
-	if (runHard !== undefined) config.runHard = runHard;
 	const wrapUpCap = envNum("PI_OUTPUT_CAP_WRAP_UP_CAP");
 	if (wrapUpCap !== undefined) config.wrapUpCap = wrapUpCap;
 
@@ -278,17 +267,18 @@ export function effectiveCap(inputs: CapInputs): number {
 
 function guideline(config: CapConfig): string {
 	return (
-		`Output budget: one response is hard-capped at ${config.perResponse} output tokens and is cut off ` +
-		"mid-sentence at the cap, so anything longer must go to a file. Write code, logs, and long prose " +
-		"with write/edit and report the path instead of pasting it. Keep chat replies short and state the " +
-		"result before the details."
+		`Output budget: every response is hard-capped at ${config.perResponse} output tokens and is cut off ` +
+		"mid-sentence at the cap, so anything longer must go to a file. Each turn starts fresh — there is no " +
+		"budget for the conversation as a whole. Write code, logs, and long prose with write/edit and report " +
+		"the path instead of pasting it. Keep chat replies short and state the result before the details."
 	);
 }
 
-function wrapUpInstruction(used: number, cap: number, reason: string): string {
+function wrapUpInstruction(used: number, cap: number): string {
 	return (
-		`[pi-output-cap] ${reason} This run has used ${used.toLocaleString("en-US")} output tokens and the next ` +
-		`response is capped at ${cap.toLocaleString("en-US")} tokens.\n` +
+		`[pi-output-cap] Your last response was cut off at the output limit after ` +
+		`${used.toLocaleString("en-US")} output tokens. The next response is capped at ` +
+		`${cap.toLocaleString("en-US")} tokens.\n` +
 		`Write a wrap-up of at most ${WRAP_UP_WORDS} words and nothing else:\n` +
 		"1. what is already done,\n" +
 		"2. what is not done,\n" +
@@ -320,11 +310,11 @@ interface UiLike {
 
 interface RunState {
 	outputTokens: number;
+	/** Output tokens of the most recent response, for the per-turn counter. */
+	lastOutput: number;
 	responses: number;
 	truncated: number;
 	capped: number;
-	steered: boolean;
-	aborted: boolean;
 	/** One-shot cap for the next request (the forced wrap-up turn). */
 	nextWrapUpCap: number;
 	/** True once the wrap-up continuation has been requested for this run. */
@@ -335,8 +325,6 @@ interface Stats {
 	sessionOutput: number;
 	truncated: number;
 	capped: number;
-	steered: number;
-	abortedRuns: number;
 	wrapUps: number;
 }
 
@@ -344,11 +332,10 @@ export default function (pi: ExtensionAPI) {
 	const config = loadConfig();
 	const run: RunState = {
 		outputTokens: 0,
+		lastOutput: 0,
 		responses: 0,
 		truncated: 0,
 		capped: 0,
-		steered: false,
-		aborted: false,
 		nextWrapUpCap: 0,
 		wrapUpRequested: false,
 	};
@@ -356,8 +343,6 @@ export default function (pi: ExtensionAPI) {
 		sessionOutput: 0,
 		truncated: 0,
 		capped: 0,
-		steered: 0,
-		abortedRuns: 0,
 		wrapUps: 0,
 	};
 	/** Cap of the last response, for the "hit the ceiling" heuristic. */
@@ -380,9 +365,9 @@ export default function (pi: ExtensionAPI) {
 				ui?.setStatus?.("pi-output-cap", undefined);
 				return;
 			}
-			const runHard = config.runHard > 0 ? `/${fmtTokens(config.runHard)}` : "";
-			const hot = config.runSoft > 0 && run.outputTokens >= config.runSoft * WARN_FRACTION ? "!" : "";
-			ui?.setStatus?.("pi-output-cap", `out ${fmtTokens(run.outputTokens)}${runHard}${hot}`);
+			const cap = lastCap > 0 ? `/${fmtTokens(lastCap)}` : "";
+			const hot = lastCap > 0 && run.lastOutput >= lastCap * CAP_HIT_FRACTION ? "!" : "";
+			ui?.setStatus?.("pi-output-cap", `turn ${fmtTokens(run.lastOutput)}${cap}${hot}`);
 		} catch {
 			// Status is decoration.
 		}
@@ -441,11 +426,10 @@ export default function (pi: ExtensionAPI) {
 	// 3. Budget for the whole run ---------------------------------------------
 	pi.on("agent_start", () => {
 		run.outputTokens = 0;
+		run.lastOutput = 0;
 		run.responses = 0;
 		run.truncated = 0;
 		run.capped = 0;
-		run.steered = false;
-		run.aborted = false;
 		run.nextWrapUpCap = 0;
 		run.wrapUpRequested = false;
 	});
@@ -462,6 +446,7 @@ export default function (pi: ExtensionAPI) {
 
 			const output = message.usage?.output ?? 0;
 			run.outputTokens += output;
+			run.lastOutput = output;
 			run.responses += 1;
 			stats.sessionOutput += output;
 			if (message.stopReason === "length") {
@@ -473,45 +458,6 @@ export default function (pi: ExtensionAPI) {
 				stats.capped += 1;
 			}
 			setStatus(ctx);
-
-			if (config.runHard > 0 && run.outputTokens >= config.runHard && !run.aborted) {
-				run.aborted = true;
-				stats.abortedRuns += 1;
-				notify(
-					ctx,
-					`pi-output-cap: run budget spent (${fmtTokens(run.outputTokens)} output tokens) — stopping the run`,
-					"warning",
-				);
-				// Outside the dispatch stack: aborting mid-dispatch can reenter pi.
-				setTimeout(() => {
-					try {
-						(ctx as { abort?: () => void }).abort?.();
-					} catch {
-						// Nothing left to do; the hard budget is best-effort.
-					}
-				}, 0);
-				return;
-			}
-
-			if (config.runSoft > 0 && run.outputTokens >= config.runSoft && !run.steered && !run.truncated) {
-				run.steered = true;
-				stats.steered += 1;
-				notify(ctx, `pi-output-cap: run budget ${WARN_FRACTION * 100 | 0}% spent — asking the agent to land the answer`, "warning");
-				// deliverAs "steer" reaches the model as soon as this message ends.
-				pi.sendUserMessage(
-					wrapUpInstruction(
-						run.outputTokens,
-						effectiveCap({
-							perResponse: config.perResponse,
-							wrapUpCap: config.wrapUpCap,
-							thinkingLevel: modelOf(ctx)?.thinkingLevel,
-							modelMaxTokens: modelOf(ctx)?.maxTokens,
-						}),
-						"Stop expanding.",
-					),
-					{ deliverAs: "steer" },
-				);
-			}
 		} catch {
 			// Accounting must never break message handling.
 		}
@@ -531,7 +477,7 @@ export default function (pi: ExtensionAPI) {
 			if (settle.outcome === "error") return undefined;
 			if (run.wrapUpRequested) return undefined;
 			if (settle.context?.canContinue === false) return undefined;
-			if (run.truncated === 0 && !run.aborted) return undefined;
+			if (run.truncated === 0) return undefined;
 
 			run.wrapUpRequested = true;
 			stats.wrapUps += 1;
@@ -543,11 +489,7 @@ export default function (pi: ExtensionAPI) {
 				modelMaxTokens: modelOf(ctx)?.maxTokens,
 				wrapUp: true,
 			});
-			notify(
-				ctx,
-				`pi-output-cap: ${run.aborted ? "run stopped on budget" : "response was truncated"} — requesting a short wrap-up`,
-				"info",
-			);
+			notify(ctx, "pi-output-cap: response was truncated — requesting a short wrap-up", "info");
 			setStatus(ctx);
 
 			return {
@@ -556,13 +498,7 @@ export default function (pi: ExtensionAPI) {
 					{
 						type: "custom_message",
 						customType: "pi-output-cap",
-						content: wrapUpInstruction(
-							run.outputTokens,
-							cap,
-							run.aborted
-								? "The output budget for this run is spent."
-								: "Your last response was cut off at the output limit.",
-						),
+						content: wrapUpInstruction(run.lastOutput, cap),
 						display: true,
 					},
 				],
@@ -595,25 +531,23 @@ export default function (pi: ExtensionAPI) {
 	const report = (ctx: unknown): string => {
 		const lines = [
 			`pi-output-cap ${config.enabled ? "on" : "off"} (footer counter ${config.status ? "on" : "off"})`,
-			`  per response: ${config.perResponse > 0 ? `${config.perResponse} tokens` : "uncapped"}`,
-			`  per run:     ${config.runSoft > 0 ? `steer at ${config.runSoft}` : "no steer"}` +
-				`${config.runHard > 0 ? `, abort at ${config.runHard}` : ", no abort"}`,
+			`  per turn:    ${config.perResponse > 0 ? `${config.perResponse} tokens` : "uncapped"}`,
 			`  wrap-up cap: ${config.wrapUpCap} tokens`,
-			`  this run:    ${fmtTokens(run.outputTokens)} output tokens in ${run.responses} response(s)` +
-				`${run.truncated > 0 ? `, ${run.truncated} truncated` : ""}` +
+			`  last turn:   ${fmtTokens(run.lastOutput)} output tokens` +
+				`${run.truncated > 0 ? `, ${run.truncated} truncated this run` : ""}` +
 				`${run.capped > 0 ? `, ${run.capped} at the cap` : ""}`,
+			`  this run:    ${fmtTokens(run.outputTokens)} output tokens in ${run.responses} response(s)`,
 			`  this session: ${fmtTokens(stats.sessionOutput)} output tokens, ` +
-				`${stats.truncated} truncated, ${stats.capped} at the cap, ${stats.steered} steer(s), ` +
-				`${stats.abortedRuns} aborted run(s), ${stats.wrapUps} wrap-up(s)`,
+				`${stats.truncated} truncated, ${stats.capped} at the cap, ${stats.wrapUps} wrap-up(s)`,
 		];
 		return lines.join("\n");
 	};
 
 	pi.registerCommand("outcap", {
 		description:
-			"Output-budget guard: /outcap shows it — /outcap off|on toggles — /outcap status on|off toggles the footer counter — /outcap per-response <n|off> — /outcap run <soft|off> [hard|off] — /outcap wrapup [text]",
+			"Per-turn output cap: /outcap shows it — /outcap off|on toggles — /outcap status on|off toggles the footer counter — /outcap per-response <n|off> — /outcap wrapup [text]",
 		getArgumentCompletions: (prefix: string) => {
-			const subs = ["on", "off", "status", "per-response", "run", "wrapup"];
+			const subs = ["on", "off", "status", "per-response", "wrapup"];
 			const matches = subs.filter((s) => s.startsWith(prefix));
 			return matches.length > 0 ? matches.map((value) => ({ value, label: value })) : null;
 		},
@@ -674,21 +608,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (sub === "run") {
-				const [softText, hardText] = values.split(/\s+/);
-				const soft = parseBudget(softText ?? "");
-				const hard = parseBudget(hardText ?? "");
-				if (soft === undefined) {
-					notify(ctx, "usage: /outcap run <soft|off> [hard|off]", "warning");
-					return;
-				}
-				config.runSoft = soft;
-				if (hard !== undefined) config.runHard = hard;
-				if (config.runHard > 0 && config.runSoft > 0 && config.runSoft > config.runHard) {
-					notify(ctx, "pi-output-cap: the steer threshold must not exceed the abort threshold — ignored", "warning");
-					return;
-				}
-				saveConfig(config);
-				notify(ctx, report(ctx), "info");
+				notify(ctx, "run budgets are gone: the cap applies per turn — /outcap per-response <tokens|off>", "warning");
 				return;
 			}
 

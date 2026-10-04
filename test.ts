@@ -165,9 +165,9 @@ function assert(cond: boolean, label: string) {
 // ---------------------------------------------------------------------------
 
 {
-	saveConfig({ ...DEFAULTS, perResponse: 24_000, runSoft: 90_000 });
+	saveConfig({ ...DEFAULTS, perResponse: 24_000 });
 	const reloaded = loadConfig();
-	assert(reloaded.perResponse === 24_000 && reloaded.runSoft === 90_000, "config survives a save/load round trip");
+	assert(reloaded.perResponse === 24_000, "config survives a save/load round trip");
 
 	process.env.PI_OUTPUT_CAP_STATUS = "1";
 	assert(loadConfig().status === true, "PI_OUTPUT_CAP_STATUS=1 turns the footer counter on");
@@ -240,52 +240,27 @@ function assert(cond: boolean, label: string) {
 }
 
 // ---------------------------------------------------------------------------
-// Run budget: steer, abort, wrap-up
+// Per-turn only: no run totals, no steer, no abort; truncation still wraps up
 // ---------------------------------------------------------------------------
 
 {
 	const fake = fakePi();
 	await activate(fake.pi);
 
-	const [result] = (await run(fake, [{ output: 40_000 }, { output: 25_000 }])) as (
-		{ continue?: boolean; entries?: { content?: string }[] } | undefined
-	)[];
-	assert(fake.sent.length === 1 && fake.sent[0].deliverAs === "steer", "crossing the soft budget steers the agent");
-	assert(fake.sent[0].content.includes("65,000"), "the steer message quotes the tokens spent");
-	assert(!result?.continue, "a clean, under-budget run settles untouched");
-	assert(fake.aborts === 0, "an under-budget run is never aborted");
-}
-
-{
-	const fake = fakePi();
-	await activate(fake.pi);
-	await run(fake, [{ output: 50_000 }]);
-	assert(fake.sent.length === 0, "no steering before the soft budget");
-}
-
-{
-	const fake = fakePi();
-	await activate(fake.pi);
-	const [result] = (await run(fake, [{ output: 60_000 }, { output: 45_000 }])) as (
-		{ continue?: boolean; entries?: { content?: string }[] } | undefined
+	const [result] = (await run(fake, [{ output: 40_000 }, { output: 25_000 }, { output: 30_000 }])) as (
+		{ continue?: boolean; entries?: unknown[] } | undefined
 	)[];
 	await new Promise((resolve) => setTimeout(resolve, 5));
-	assert(fake.aborts === 1, "crossing the hard budget aborts the run");
-	assert(fake.notifications.some((n) => n.includes("budget spent")), "the abort is reported to the user");
-	assert(result?.continue === true, "an aborted run still asks for a wrap-up");
-	assert(result?.entries?.[0]?.content?.includes("120 words"), "the wrap-up asks for a bounded reply");
+	assert(fake.sent.length === 0, "a long run is never steered — the cap is per turn");
+	assert(fake.aborts === 0, "a long run is never aborted — there is no chat-wide budget");
+	assert(!result?.continue, "a run that finished on its own settles untouched");
 }
 
 {
 	const fake = fakePi();
 	await activate(fake.pi);
-	const [result] = (await run(fake, [{ output: 20_000, stopReason: "length" }])) as (
-		{ continue?: boolean; entries?: { content?: string }[] } | undefined
-	)[];
-	assert(fake.sent.length === 0, "a truncated response does not also trigger a steer");
-	assert(result?.continue === true && result.entries.length === 1, "a truncated response turns into a wrap-up turn");
-	assert(result?.entries?.[0]?.content?.includes("cut off"), "the wrap-up names the truncation");
-	assert(fake.notifications.some((n) => n.includes("truncated")), "truncation is reported");
+	await run(fake, [{ output: 50_000 }, { output: 50_000 }]);
+	assert(fake.sent.length === 0 && fake.aborts === 0, "big responses alone trigger nothing");
 }
 
 {
@@ -330,7 +305,7 @@ function assert(cond: boolean, label: string) {
 	await emit(fake, "message_end", assistant(5_000, "length"));
 
 	await fake.commands.outcap.handler("", ctx(fake));
-	assert(fake.notifications.some((n) => n.includes("per response: 16384")), "/outcap reports the caps");
+	assert(fake.notifications.some((n) => n.includes("per turn:    16384")), "/outcap reports the caps");
 	assert(fake.notifications.some((n) => n.includes("footer counter off")), "the footer counter is off by default");
 	assert(
 		fake.statuses.every((s) => s === undefined),
@@ -355,15 +330,15 @@ function assert(cond: boolean, label: string) {
 	await fake.commands.outcap.handler("per-response 24576", ctx(fake));
 	await fake.commands.outcap.handler("run 90000 120000", ctx(fake));
 	await fake.commands.outcap.handler("", ctx(fake));
-	assert(fake.notifications.some((n) => n.includes("per response: 24576")), "/outcap per-response sets the cap");
-	assert(fake.notifications.some((n) => n.includes("steer at 90000")), "/outcap run sets the run budgets");
+	assert(fake.notifications.some((n) => n.includes("per turn:    24576")), "/outcap per-response sets the cap");
+	assert(fake.notifications.some((n) => n.includes("run budgets are gone")), "/outcap run explains the per-turn cap");
 	assert(JSON.parse(readFileSync(process.env.PI_OUTPUT_CAP_CONFIG as string, "utf8")).perResponse === 24576, "command changes are persisted");
 	assert(JSON.parse(readFileSync(process.env.PI_OUTPUT_CAP_CONFIG as string, "utf8")).status === false, "the footer setting is persisted");
 
 	await fake.commands.outcap.handler("on", ctx(fake));
 	await fake.commands.outcap.handler("status on", ctx(fake));
 	await emit(fake, "message_end", assistant(3_000));
-	assert(fake.statuses.some((s) => typeof s === "string" && s.includes("out 8.0k")), "/outcap status on shows the counter");
+	assert(fake.statuses.some((s) => typeof s === "string" && s.includes("turn 3.0k")), "/outcap status on shows the last turn");
 	await fake.commands.outcap.handler("status off", ctx(fake));
 	await emit(fake, "message_end", assistant(4_000));
 	assert(fake.statuses.at(-1) === undefined, "/outcap status off clears the footer");
